@@ -1,9 +1,9 @@
 {
-  "phase": "waiting_topic",
+  "phase": "cooldown",
   "last_update_id": 41914374,
   "last_topics_date": "2026-07-06",
   "selected_topic": "",
   "draft_text": "",
   "cover_url": "",
-  "published_msg_id": 923
+  "published_msg_id": 924
 }
