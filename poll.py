@@ -26,12 +26,21 @@ BANK_PATH = REPO / "topics-bank.tsv"
 COVERS_REPO_URL = "https://github.com/alexsmirnov158-coder/drafter-covers.git"
 COVERS_RAW_BASE = "https://raw.githubusercontent.com/alexsmirnov158-coder/drafter-covers/main"
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
-HF_TOKEN = os.environ["HF_TOKEN"]
-GH_PAT = os.environ["GH_PAT"]
+# Env are read lazily so the module is importable in tests without secrets.
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+GH_PAT = os.environ.get("GH_PAT", "")
 CHANNEL = "@Drafter_community"
+
+
+def _require_env():
+    """Fail fast if required env vars missing (called from main, not on import)."""
+    missing = [n for n in ("BOT_TOKEN", "CHAT_ID", "ANTHROPIC_KEY", "HF_TOKEN", "GH_PAT")
+               if not os.environ.get(n)]
+    if missing:
+        raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
 # 10:00 Europe/Moscow == 07:00 UTC
 TOPICS_HOUR_UTC = 7
@@ -160,9 +169,10 @@ def upload_cover_to_repo(local_path, dest_name):
 
 # ------------------------------------------------------------------ phase handlers
 
-def send_topics(state):
+def load_bank(bank_path=BANK_PATH):
+    """Parse topics-bank.tsv into list of (category, title) tuples."""
     rows = []
-    with open(BANK_PATH, encoding="utf-8") as f:
+    with open(bank_path, encoding="utf-8") as f:
         for line in f:
             line = line.rstrip("\n")
             if not line:
@@ -170,25 +180,47 @@ def send_topics(state):
             cat, _, title = line.partition("\t")
             if title:
                 rows.append((cat.strip(), title.strip()))
-    random.shuffle(rows)
+    return rows
+
+
+def pick_topics(rows, count=5, rng=None):
+    """Pick `count` topics with preference for distinct categories.
+
+    Pure function: takes a list of (cat, title), returns picked list.
+    Pass `rng` (random.Random) for deterministic tests.
+    """
+    if rng is None:
+        rng = random
+    shuffled = list(rows)
+    rng.shuffle(shuffled)
     picked, seen = [], set()
-    for cat, title in rows:
+    for cat, title in shuffled:
         if cat not in seen:
             picked.append((cat, title))
             seen.add(cat)
-            if len(picked) == 5:
+            if len(picked) == count:
                 break
-    if len(picked) < 5:
-        for cat, title in rows:
+    if len(picked) < count:
+        for cat, title in shuffled:
             if (cat, title) not in picked:
                 picked.append((cat, title))
-                if len(picked) == 5:
+                if len(picked) == count:
                     break
+    return picked
+
+
+def format_topics_message(picked):
+    """Render picked topics list as the bot message text."""
     lines = ["☀️ Темы на сегодня:", ""]
     for i, (cat, title) in enumerate(picked, 1):
         lines.append(f"{i}. {cat} — {title}")
     lines += ["", "Ответь номером или своей идеей."]
-    text = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def send_topics(state):
+    picked = pick_topics(load_bank())
+    text = format_topics_message(picked)
     tg_send_message(CHAT_ID, text)
     # Save what was sent so we can match user reply
     (REPO / "last-topics.txt").write_text(text)
@@ -289,7 +321,47 @@ def publish_post(state):
 
 # ------------------------------------------------------------------ main
 
+def should_send_topics(state, now, hour_utc=TOPICS_HOUR_UTC):
+    """Return True if the daily topics send should fire on this tick.
+
+    Pure function of (state, now); no side effects.
+    """
+    today = now.date().isoformat()
+    if state.get("last_topics_date") == today:
+        return False
+    if now.hour < hour_utc:
+        return False
+    # cooldown resets to idle on a new day (see main); include it here too
+    return state["phase"] in ("idle", "cooldown")
+
+
+APPROVE_TOKENS = {"публикуй", "ок", "publish", "ok", "+", "да", "yes"}
+REGEN_TOKENS = {"переделай", "regen", "переделать"}
+
+
+def classify_reply(text, phase):
+    """Return one of: 'approve', 'regen', 'topic', None.
+
+    Given a user message text and current state.phase, decides what action
+    the reply implies. Does not perform side effects.
+    """
+    if not text:
+        return None
+    t = text.strip()
+    if phase == "awaiting_approval":
+        low = t.lower()
+        if low in APPROVE_TOKENS:
+            return "approve"
+        if low in REGEN_TOKENS:
+            return "regen"
+        return None
+    if phase == "waiting_topic":
+        return "topic"  # caller then calls parse_user_topic
+    return None
+
+
 def main():
+    _require_env()
     state = load_state()
     today = now_utc().date().isoformat()
     new_day = state.get("last_topics_date") != today
